@@ -93,6 +93,10 @@ declare -i STAT_FAILED=0
 declare -i STAT_BACKED_UP=0
 
 # 模块调度表: 模块名 → 配置函数 + 描述
+# 标准模块顺序 (用于列表展示和执行)
+readonly MODULE_ORDER=("system" "shell" "apt" "dnf" "docker-daemon" "docker-client" \
+                        "git" "npm" "pip" "curl" "wget" "snap" "containerd" "systemd")
+
 declare -A TARGET_HANDLERS=(
     ["system"]="configure_system_environment"
     ["apt"]="configure_apt"
@@ -245,7 +249,12 @@ write_file() {
     dir=$(dirname "$file")
     ensure_dir "$dir"
 
-    if echo "$content" | sudo_wrap tee "$file" > /dev/null 2>&1; then
+    # 用户 home 目录下的文件不通过 sudo 写入，避免 root 属主问题
+    local write_cmd="tee"
+    if [[ "$file" != "$HOME"* ]]; then
+        write_cmd="sudo_wrap tee"
+    fi
+    if echo "$content" | $write_cmd "$file" > /dev/null 2>&1; then
         log_success "$desc — 配置完成"
         STAT_CONFIGURED=$((STAT_CONFIGURED + 1))
         return 0
@@ -440,9 +449,7 @@ detect_pkg_manager() {
 list_targets() {
     echo "可用模块列表:"
     echo ""
-    local order=("system" "apt" "dnf" "docker-daemon" "docker-client" \
-                 "git" "npm" "pip" "curl" "wget" "snap" "containerd" \
-                 "systemd" "shell")
+    local order=("${MODULE_ORDER[@]}")
     for t in "${order[@]}"; do
         local desc="${TARGET_DESCRIPTIONS[$t]:-$t}"
         printf "  %-16s — %s\n" "$t" "$desc"
@@ -512,9 +519,7 @@ select_targets_interactive() {
     local idx=1
     declare -A idx_to_key
 
-    for t in "system" "apt" "dnf" "docker-daemon" "docker-client" \
-             "git" "npm" "pip" "curl" "wget" "snap" "containerd" \
-             "systemd" "shell"; do
+    for t in "${MODULE_ORDER[@]}"; do
         if ${TARGET_AVAILABLE[$t]}; then
             available_keys+=("$t")
             idx_to_key[$idx]="$t"
@@ -813,20 +818,21 @@ configure_docker_client() {
 
     if $REMOVE_MODE; then
         if [[ -f "$docker_config" ]]; then
-            # 使用 python3 或 jq 或手动处理 JSON 移除 proxies 键
             if command_exists python3; then
                 local new_json
-                new_json=$(python3 -c "
+                new_json=$(python3 - "$docker_config" <<'PYEOF'
 import json, sys
 try:
-    cfg = json.load(open('$docker_config'))
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
     cfg.pop('proxies', None)
     json.dump(cfg, sys.stdout, indent=2)
     print()
 except Exception as e:
-    print('ERROR:' + str(e), file=sys.stderr)
+    print('ERROR:', str(e), file=sys.stderr)
     sys.exit(1)
-" 2>/dev/null)
+PYEOF
+)
                 if [[ -n "$new_json" ]] && [[ ! "$new_json" =~ ^ERROR: ]]; then
                     write_file "$docker_config" "$new_json" "Docker 客户端代理 (移除)"
                 else
@@ -836,7 +842,7 @@ except Exception as e:
             elif command_exists jq; then
                 local new_json
                 new_json=$(jq 'del(.proxies)' "$docker_config" 2>/dev/null)
-                if [[ -n "$new_json" ]]; then
+                if [[ -n "$new_json" ]] && [[ "$new_json" != "null" ]]; then
                     write_file "$docker_config" "$new_json" "Docker 客户端代理 (移除)"
                 else
                     log_warn "Docker 客户端代理移除 — jq 处理失败，跳过"
@@ -872,23 +878,24 @@ EOF
     if [[ -f "$docker_config" ]]; then
         local new_json
         if command_exists python3; then
-            new_json=$(python3 -c "
+            new_json=$(python3 - "$docker_config" "$proxy_url" "$NO_PROXY" <<'PYEOF'
 import json, sys
 try:
-    with open('$docker_config') as f:
+    with open(sys.argv[1]) as f:
         cfg = json.load(f)
 except (FileNotFoundError, json.JSONDecodeError):
     cfg = {}
 cfg['proxies'] = {
     'default': {
-        'httpProxy': '${proxy_url}',
-        'httpsProxy': '${proxy_url}',
-        'noProxy': '${NO_PROXY}'
+        'httpProxy': sys.argv[2],
+        'httpsProxy': sys.argv[2],
+        'noProxy': sys.argv[3]
     }
 }
 json.dump(cfg, sys.stdout, indent=2)
 print()
-" 2>/dev/null)
+PYEOF
+)
             if [[ -n "$new_json" ]]; then
                 write_file "$docker_config" "$new_json" "Docker 客户端代理"
             else
@@ -899,7 +906,7 @@ print()
             new_json=$(jq --arg http "$proxy_url" --arg https "$proxy_url" --arg no "$NO_PROXY" \
                 '.proxies.default.httpProxy = $http | .proxies.default.httpsProxy = $https | .proxies.default.noProxy = $no' \
                 "$docker_config" 2>/dev/null)
-            if [[ -n "$new_json" ]]; then
+            if [[ -n "$new_json" ]] && [[ "$new_json" != "null" ]]; then
                 write_file "$docker_config" "$new_json" "Docker 客户端代理"
             else
                 log_error "Docker 客户端代理配置 — jq 处理失败"
@@ -1122,7 +1129,7 @@ configure_curl() {
         if [[ -f "$curlrc" ]]; then
             # 移除代理行
             local cleaned
-            cleaned=$(grep -vE '^(proxy|noproxy)=' "$curlrc" 2>/dev/null || true)
+            cleaned=$(grep -vE '^[[:space:]]*(proxy|noproxy)[[:space:]]*=' "$curlrc" 2>/dev/null || true)
             if [[ -z "$(echo "$cleaned" | tr -d '[:space:]')" ]]; then
                 rm "$curlrc" 2>/dev/null || true
                 log_success "curl 代理 — 已移除 (~/.curlrc 已删除)"
@@ -1142,7 +1149,7 @@ configure_curl() {
     if [[ -f "$curlrc" ]]; then
         content=$(cat "$curlrc")
         # 移除旧的代理行
-        content=$(echo "$content" | grep -vE '^(proxy|noproxy)=' || true)
+        content=$(echo "$content" | grep -vE '^[[:space:]]*(proxy|noproxy)[[:space:]]*=' || true)
         content+=$'\n'"${MARKER}"$'\n'
         content+="proxy = \"${proxy_url}\""$'\n'
         content+="noproxy = \"${NO_PROXY}\""
@@ -1176,7 +1183,8 @@ configure_wget() {
         if [[ -f "$wgetrc" ]]; then
             local cleaned
             # 移除我们管理的代理行和注释代理行
-            cleaned=$(grep -vF "$MARKER" "$wgetrc" | grep -vE '^(https?_proxy|ftp_proxy|use_proxy)\s*=.*#.*proxy-config' || true)
+            # 移除 MARKER 行及其后的代理行
+            cleaned=$(grep -vF "$MARKER" "$wgetrc" | grep -vE '^(https?_proxy|ftp_proxy|use_proxy)\s*=' || true)
             write_file "$wgetrc" "$cleaned" "wget 全局代理 (移除)"
         else
             log_info "wget 全局配置不存在，跳过"
@@ -1291,35 +1299,15 @@ configure_containerd() {
         return 0
     fi
 
-    # 检查是否已有我们的配置
+    # containerd 通过 Docker daemon systemd 环境变量获取代理
+    # 无需在 config.toml 中配置代理，仅确保 Docker 代理已配置即可
     if grep -qF "$MARKER" "$containerd_conf" 2>/dev/null; then
-        # 更新现有配置块中的代理 URL
-        local updated
-        updated=$(sed -E "/$MARKER_START/,/$MARKER_END/ s|(HTTP_PROXY|HTTPS_PROXY|NO_PROXY) = \".*\"|\"${proxy_url}\"|g" "$containerd_conf")
-        write_file "$containerd_conf" "$updated" "containerd 代理 (更新)"
+        log_info "containerd 代理 — 由 Docker daemon 环境变量管理，跳过"
+        STAT_SKIPPED=$((STAT_SKIPPED + 1))
     else
-        # 追加新的配置块
-        local proxy_block
-        proxy_block=$(cat <<EOF
-
-${MARKER_START}
-${MARKER}
-[plugins."io.containerd.grpc.v1.cri".registry.mirrors]
-  [plugins."io.containerd.grpc.v1.cri".registry.configs]
-    [plugins."io.containerd.grpc.v1.cri".registry.configs."docker.io"]
-      [plugins."io.containerd.grpc.v1.cri".registry.configs."docker.io".tls]
-        insecure_skip_verify = false
-${MARKER_END}
-EOF
-)
-        local content
-        content=$(cat "$containerd_conf")
-        content+="$proxy_block"
-        write_file "$containerd_conf" "$content" "containerd 代理"
+        log_info "containerd 代理 — 由 Docker daemon 环境变量管理，无需额外配置"
+        STAT_SKIPPED=$((STAT_SKIPPED + 1))
     fi
-
-    # containerd 本身通过 systemd 环境变量获取代理，通过 Docker daemon 的代理配置即可
-    # 这里主要是确保配置存在
     log_info "containerd 通过 Docker daemon 环境变量获取代理，已由 Docker 配置覆盖"
 }
 
@@ -1475,9 +1463,7 @@ detect_applications() {
     local detect_count=0
     local detect_list=()
 
-    local order=("system" "shell" "apt" "dnf" "docker-daemon" "docker-client" \
-                 "git" "npm" "pip" "curl" "wget" "snap" "containerd" "systemd")
-
+    local order=("${MODULE_ORDER[@]}")
     for t in "${order[@]}"; do
         local desc="${TARGET_DESCRIPTIONS[$t]:-$t}"
         if ${TARGET_AVAILABLE[$t]}; then
@@ -1511,9 +1497,7 @@ run_all_configurations() {
     log_info "开始配置... (代理: $(build_proxy_url))"
     log_info "NO_PROXY: ${NO_PROXY}"
 
-    local order=("system" "apt" "dnf" "docker-daemon" "docker-client" \
-                 "git" "npm" "pip" "curl" "wget" "snap" "containerd" \
-                 "systemd" "shell")
+    local order=("${MODULE_ORDER[@]}")
 
     for t in "${order[@]}"; do
         # 跳过未启用的模块
@@ -1756,8 +1740,8 @@ load_config_file() {
                     NO_PROXY="$value"
                 fi
                 ;;
-            DRY_RUN)    DRY_RUN=true ;;
-            REMOVE)     REMOVE_MODE=true ;;
+            DRY_RUN)    DRY_RUN=$( [[ "$value" =~ ^[Tt] ]] && echo true || echo false) ;;
+            REMOVE)     REMOVE_MODE=$( [[ "$value" =~ ^[Tt] ]] && echo true || echo false) ;;
         esac
     done < "$CONFIG_FILE"
 }
