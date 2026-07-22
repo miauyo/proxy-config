@@ -1537,12 +1537,20 @@ configure_current_shell() {
 # 交互模式
 #===============================================================================
 run_interactive() {
-    # 检查是否有可用的终端输入
+    # 管道模式 (curl|bash): 尝试从 /dev/tty 重新打开终端
     if [[ ! -t 0 ]]; then
-        log_error "交互模式需要终端输入 (stdin 不是 TTY)"
-        log_error "请使用命令行模式: --proxy <URL>"
-        log_error "或重定向终端:  </dev/tty sudo ./proxy-config.sh"
-        exit 1
+        if [[ -r /dev/tty ]]; then
+            # 重定向 stdin 到真实终端
+            exec 0</dev/tty 2>/dev/null || {
+                log_error "无法打开终端 /dev/tty"
+                log_error "请使用命令行模式: curl ... | sudo bash -s -- --proxy <URL>"
+                exit 1
+            }
+        else
+            log_error "交互模式需要终端输入 (stdin 不是 TTY 且 /dev/tty 不可用)"
+            log_error "请使用命令行模式: curl ... | sudo bash -s -- --proxy <URL>"
+            exit 1
+        fi
     fi
 
     echo -e "${COLORS[bold]}${COLORS[cyan]}"
