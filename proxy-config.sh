@@ -92,6 +92,48 @@ declare -i STAT_SKIPPED=0
 declare -i STAT_FAILED=0
 declare -i STAT_BACKED_UP=0
 
+# 模块调度表: 模块名 → 配置函数 + 描述
+declare -A TARGET_HANDLERS=(
+    ["system"]="configure_system_environment"
+    ["apt"]="configure_apt"
+    ["dnf"]="configure_dnf"
+    ["docker-daemon"]="configure_docker_daemon"
+    ["docker-client"]="configure_docker_client"
+    ["git"]="configure_git"
+    ["npm"]="configure_npm"
+    ["pip"]="configure_pip"
+    ["curl"]="configure_curl"
+    ["wget"]="configure_wget"
+    ["snap"]="configure_snap"
+    ["containerd"]="configure_containerd"
+    ["systemd"]="configure_systemd"
+    ["shell"]="configure_current_shell"
+)
+
+declare -A TARGET_DESCRIPTIONS=(
+    ["system"]="系统环境变量 (/etc/profile.d, /etc/environment)"
+    ["apt"]="APT 包管理器 (Debian/Ubuntu)"
+    ["dnf"]="DNF/YUM 包管理器 (RHEL/Fedora)"
+    ["docker-daemon"]="Docker 守护进程"
+    ["docker-client"]="Docker 客户端"
+    ["git"]="Git 全局代理"
+    ["npm"]="npm 代理"
+    ["pip"]="pip (Python) 代理"
+    ["curl"]="curl 代理 (~/.curlrc)"
+    ["wget"]="wget 代理 (/etc/wgetrc)"
+    ["snap"]="Snap 代理"
+    ["containerd"]="containerd 代理"
+    ["systemd"]="systemd 全局环境代理"
+    ["shell"]="当前 Shell 会话环境变量"
+)
+
+# 模块启用状态: 用户勾选 or --targets 控制
+declare -A TARGET_ENABLED
+# 模块可用性: 工具已安装则为 true
+declare -A TARGET_AVAILABLE
+# 用户通过 --targets 指定的列表（空=全部）
+TARGETS_FILTER=""
+
 #===============================================================================
 # 工具函数
 #===============================================================================
@@ -388,6 +430,134 @@ detect_pkg_manager() {
     elif command_exists apk; then      echo "apk"
     else                               echo "none"
     fi
+}
+
+#===============================================================================
+# 目标选择函数
+#===============================================================================
+
+# 列出所有可用模块
+list_targets() {
+    echo "可用模块列表:"
+    echo ""
+    local order=("system" "apt" "dnf" "docker-daemon" "docker-client" \
+                 "git" "npm" "pip" "curl" "wget" "snap" "containerd" \
+                 "systemd" "shell")
+    for t in "${order[@]}"; do
+        local desc="${TARGET_DESCRIPTIONS[$t]:-$t}"
+        printf "  %-16s — %s\n" "$t" "$desc"
+    done
+    echo ""
+    echo "用法: --targets system,git,npm,docker-daemon"
+}
+
+# 初始化 TARGET_AVAILABLE 和 TARGET_ENABLED
+init_targets() {
+    for t in "${!TARGET_HANDLERS[@]}"; do
+        TARGET_AVAILABLE[$t]=false
+        TARGET_ENABLED[$t]=false
+    done
+
+    TARGET_AVAILABLE[system]=true
+    TARGET_AVAILABLE[shell]=true
+
+    local pkg_mgr
+    pkg_mgr=$(detect_pkg_manager)
+    if [[ "$pkg_mgr" == "apt" ]]; then TARGET_AVAILABLE[apt]=true; fi
+    if [[ "$pkg_mgr" =~ ^(dnf|yum)$ ]]; then TARGET_AVAILABLE[dnf]=true; fi
+    if command_exists dockerd || command_exists docker; then TARGET_AVAILABLE[docker-daemon]=true; fi
+    if command_exists docker; then TARGET_AVAILABLE[docker-client]=true; fi
+    if command_exists git; then TARGET_AVAILABLE[git]=true; fi
+    if command_exists npm; then TARGET_AVAILABLE[npm]=true; fi
+    if command_exists pip3 || command_exists pip; then TARGET_AVAILABLE[pip]=true; fi
+    if command_exists curl; then TARGET_AVAILABLE[curl]=true; fi
+    if command_exists wget; then TARGET_AVAILABLE[wget]=true; fi
+    if command_exists snap; then TARGET_AVAILABLE[snap]=true; fi
+    if command_exists containerd; then TARGET_AVAILABLE[containerd]=true; fi
+    if command_exists systemctl; then TARGET_AVAILABLE[systemd]=true; fi
+
+    if [[ -n "$TARGETS_FILTER" ]]; then
+        IFS=',' read -ra wanted <<< "$TARGETS_FILTER"
+        for t in "${wanted[@]}"; do
+            t=$(echo "$t" | xargs)
+            [[ -z "$t" ]] && continue
+            if [[ -n "${TARGET_HANDLERS[$t]:-}" ]]; then
+                if ${TARGET_AVAILABLE[$t]}; then
+                    TARGET_ENABLED[$t]=true
+                else
+                    log_warn "模块 '$t' — 对应工具未安装，跳过"
+                fi
+            else
+                log_warn "未知模块: '$t' — 使用 --list-targets 查看可用模块"
+            fi
+        done
+    else
+        for t in "${!TARGET_HANDLERS[@]}"; do
+            if ${TARGET_AVAILABLE[$t]}; then
+                TARGET_ENABLED[$t]=true
+            fi
+        done
+    fi
+}
+
+# 交互模式下用户勾选模块
+select_targets_interactive() {
+    echo ""
+    echo -e "${COLORS[bold]}选择要配置的模块 (默认全选):${COLORS[reset]}"
+    echo -e "  输入编号反选，如 ${COLORS[cyan]}1,3,5${COLORS[reset]} 取消/恢复对应模块"
+    echo -e "  直接按 ${COLORS[cyan]}回车${COLORS[reset]} 确认全部"
+    echo ""
+
+    local available_keys=()
+    local idx=1
+    declare -A idx_to_key
+
+    for t in "system" "apt" "dnf" "docker-daemon" "docker-client" \
+             "git" "npm" "pip" "curl" "wget" "snap" "containerd" \
+             "systemd" "shell"; do
+        if ${TARGET_AVAILABLE[$t]}; then
+            available_keys+=("$t")
+            idx_to_key[$idx]="$t"
+            local desc="${TARGET_DESCRIPTIONS[$t]:-$t}"
+            local mark
+            if ${TARGET_ENABLED[$t]}; then
+                mark="${COLORS[green]}✓${COLORS[reset]}"
+            else
+                mark="${COLORS[dim]}✗${COLORS[reset]}"
+            fi
+            printf "  ${COLORS[bold]}%2d${COLORS[reset]}. %s %s\n" "$idx" "$mark" "$desc"
+            idx=$((idx + 1))
+        fi
+    done
+
+    echo ""
+    read -r -p "  取消/恢复哪些模块? [直接回车=全选]: " deselection
+
+    if [[ -n "$deselection" ]]; then
+        IFS=',' read -ra deselected <<< "$deselection"
+        for num in "${deselected[@]}"; do
+            num=$(echo "$num" | xargs)
+            if [[ "$num" =~ ^[0-9]+$ ]] && [[ -n "${idx_to_key[$num]:-}" ]]; then
+                local key="${idx_to_key[$num]}"
+                # 反选
+                if ${TARGET_ENABLED[$key]}; then
+                    TARGET_ENABLED[$key]=false
+                else
+                    TARGET_ENABLED[$key]=true
+                fi
+            fi
+        done
+    fi
+
+    # 打印最终选择
+    echo ""
+    local selected_count=0
+    for t in "${available_keys[@]}"; do
+        if ${TARGET_ENABLED[$t]}; then
+            selected_count=$((selected_count + 1))
+        fi
+    done
+    print_info "已选择 ${COLORS[bold]}${selected_count}${COLORS[reset]} / ${#available_keys[@]} 个模块"
 }
 
 #===============================================================================
@@ -1297,37 +1467,29 @@ run_interactive() {
 # 检测已安装的应用
 #===============================================================================
 detect_applications() {
+    init_targets
+
     echo ""
     print_info "检测已安装的应用..."
 
     local detect_count=0
     local detect_list=()
 
-    local apps=(
-        "系统环境变量:true"
-        "当前Shell:true"
-        "APT:$( [[ "$(detect_pkg_manager)" == "apt" ]] && echo true || echo false )"
-        "DNF/YUM:$( [[ "$(detect_pkg_manager)" =~ ^(dnf|yum)$ ]] && echo true || echo false )"
-        "Docker 守护进程:$( command_exists dockerd || command_exists docker && echo true || echo false )"
-        "Docker 客户端:$( command_exists docker && echo true || echo false )"
-        "Git:$( command_exists git && echo true || echo false )"
-        "npm:$( command_exists npm && echo true || echo false )"
-        "pip:$( command_exists pip3 || command_exists pip && echo true || echo false )"
-        "curl:$( command_exists curl && echo true || echo false )"
-        "wget:$( command_exists wget && echo true || echo false )"
-        "Snap:$( command_exists snap && echo true || echo false )"
-        "containerd:$( command_exists containerd && echo true || echo false )"
-        "systemd:$( command_exists systemctl && echo true || echo false )"
-    )
+    local order=("system" "shell" "apt" "dnf" "docker-daemon" "docker-client" \
+                 "git" "npm" "pip" "curl" "wget" "snap" "containerd" "systemd")
 
-    for app in "${apps[@]}"; do
-        local name="${app%%:*}"
-        local installed="${app##*:}"
-        if [[ "$installed" == "true" ]]; then
-            detect_list+=("${COLORS[green]}✓${COLORS[reset]} $name")
-            detect_count=$((detect_count + 1))
+    for t in "${order[@]}"; do
+        local desc="${TARGET_DESCRIPTIONS[$t]:-$t}"
+        if ${TARGET_AVAILABLE[$t]}; then
+            local mark="${COLORS[green]}✓${COLORS[reset]}"
+            if ${TARGET_ENABLED[$t]}; then
+                detect_list+=("$mark $desc")
+                detect_count=$((detect_count + 1))
+            else
+                detect_list+=("${COLORS[yellow]}✗${COLORS[reset]} $desc ${COLORS[dim]}(已跳过)${COLORS[reset]}")
+            fi
         else
-            detect_list+=("${COLORS[dim]}✗${COLORS[reset]} $name ${COLORS[dim]}(未安装)${COLORS[reset]}")
+            detect_list+=("${COLORS[dim]}✗${COLORS[reset]} $desc ${COLORS[dim]}(未安装)${COLORS[reset]}")
         fi
     done
 
@@ -1349,32 +1511,28 @@ run_all_configurations() {
     log_info "开始配置... (代理: $(build_proxy_url))"
     log_info "NO_PROXY: ${NO_PROXY}"
 
-    # 按顺序执行每个模块
-    local modules=(
-        "configure_system_environment"
-        "configure_apt"
-        "configure_dnf"
-        "configure_docker_daemon"
-        "configure_docker_client"
-        "configure_git"
-        "configure_npm"
-        "configure_pip"
-        "configure_curl"
-        "configure_wget"
-        "configure_snap"
-        "configure_containerd"
-        "configure_systemd"
-        "configure_current_shell"
-    )
+    local order=("system" "apt" "dnf" "docker-daemon" "docker-client" \
+                 "git" "npm" "pip" "curl" "wget" "snap" "containerd" \
+                 "systemd" "shell")
 
-    for module in "${modules[@]}"; do
+    for t in "${order[@]}"; do
+        # 跳过未启用的模块
+        if ! ${TARGET_ENABLED[$t]:-false}; then
+            continue
+        fi
+
+        local handler="${TARGET_HANDLERS[$t]:-}"
+        if [[ -z "$handler" ]]; then
+            continue
+        fi
+
         total=$((total + 1))
         local rc=0
-        $module || rc=$?
+        $handler || rc=$?
 
         case $rc in
             0) ;; # 成功或失败已在模块内计入
-            2) skipped=$((skipped + 1)) ;;  # 模块未安装，由这里计入
+            2) skipped=$((skipped + 1)) ;;  # 模块未安装
         esac
     done
 }
@@ -1454,6 +1612,12 @@ print_usage() {
 
   --log-file <FILE>      日志文件路径 (默认: 自动选择)
 
+  --targets, -t <LIST>   仅配置指定模块 (逗号分隔)
+                         示例: --targets git,npm,docker-daemon
+                         使用 --list-targets 查看所有可用模块
+
+  --list-targets         列出所有可用模块
+
   --no-color             禁用彩色输出
 
   --non-interactive      非交互模式 (与 --proxy 一起使用)
@@ -1514,6 +1678,15 @@ parse_args() {
                     COLORS[$key]=""
                 done
                 shift
+                ;;
+            --targets|-t)
+                TARGETS_FILTER="$2"
+                shift 2
+                ;;
+            --list-targets)
+                init_targets
+                list_targets
+                exit 0
                 ;;
             --non-interactive)
                 INTERACTIVE=false
@@ -1683,10 +1856,15 @@ main() {
         echo ""
     fi
 
-    # 检测应用
+    # 检测应用并初始化目标
     detect_applications
 
-    # 执行所有配置模块
+    # 交互模式下让用户勾选模块
+    if $INTERACTIVE; then
+        select_targets_interactive
+    fi
+
+    # 执行配置模块
     run_all_configurations
 
     # 打印总结
