@@ -1281,10 +1281,15 @@ configure_wget() {
     if $REMOVE_MODE; then
         if [[ -f "$wgetrc" ]]; then
             local cleaned
-            # 移除我们管理的代理行和注释代理行
-            # 移除 MARKER 行及其后的代理行
-            cleaned=$(grep -vF "$MARKER" "$wgetrc" | grep -vE '^(https?_proxy|ftp_proxy|use_proxy)\s*=' || true)
+            # 移除管理的代理行 (含认证字段)
+            cleaned=$(grep -vF "$MARKER" "$wgetrc" | grep -vE '^(https?_proxy|ftp_proxy|use_proxy|proxy_user|proxy_password)\s*=' || true)
             write_file "$wgetrc" "$cleaned" "wget 全局代理 (移除)"
+            # 同时清理 wget2 配置
+            if [[ -f /etc/wget2rc ]]; then
+                local w2c
+                w2c=$(grep -vF "$MARKER" /etc/wget2rc | grep -vE '^(https?_proxy|ftp_proxy|use_proxy|proxy_user|proxy_password)\s*=' || true)
+                write_file /etc/wget2rc "$w2c" "wget2 全局代理 (移除)"
+            fi
         else
             log_info "wget 全局配置不存在，跳过"
             STAT_SKIPPED=$((STAT_SKIPPED + 1))
@@ -1403,34 +1408,7 @@ configure_containerd() {
 
     print_header "containerd"
 
-    local containerd_conf="/etc/containerd/config.toml"
-    local proxy_url
-    proxy_url=$(build_proxy_url)
-
-    if [[ ! -f "$containerd_conf" ]]; then
-        log_info "containerd 配置文件不存在，跳过"
-        return 2
-    fi
-
-    if $REMOVE_MODE; then
-        # 移除 proxy 相关 TOML section
-        if grep -qF "$MARKER" "$containerd_conf" 2>/dev/null; then
-            local cleaned
-            cleaned=$(sed "/$MARKER_START/,/$MARKER_END/d" "$containerd_conf" 2>/dev/null || true)
-            write_file "$containerd_conf" "$cleaned" "containerd 代理 (移除)"
-
-            if ! $DRY_RUN; then
-                sudo_wrap systemctl restart containerd 2>/dev/null || log_warn "containerd 重启失败，请手动重启"
-            fi
-        else
-            log_info "containerd 代理未由本脚本管理，跳过"
-            STAT_SKIPPED=$((STAT_SKIPPED + 1))
-        fi
-        return 0
-    fi
-
     # containerd 通过 systemd drop-in 获取代理环境变量
-    # (独立部署时不会继承 Docker 的环境变量)
     local containerd_svc="/etc/systemd/system/containerd.service.d/http-proxy.conf"
     local proxy_url
     proxy_url=$(build_proxy_url)
@@ -1472,7 +1450,6 @@ EOF
         sudo_wrap systemctl daemon-reload 2>/dev/null || log_warn "systemctl daemon-reload 失败"
         sudo_wrap systemctl restart containerd 2>/dev/null || log_warn "containerd 重启失败，请手动重启"
     fi
-    log_info "containerd 通过 Docker daemon 环境变量获取代理，已由 Docker 配置覆盖"
 }
 
 #---------------------------------------------------------------------------
