@@ -23,9 +23,33 @@
 
 ## 快速开始
 
-### 交互模式（推荐）
+### 一键运行（推荐）
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/miauyo/proxy-config/main/proxy-config.sh | sudo bash
+```
+
+带参数一键运行：
+
+```bash
+# 直接指定代理地址
+curl -fsSL https://raw.githubusercontent.com/miauyo/proxy-config/main/proxy-config.sh | sudo bash -s -- --proxy http://10.0.0.10:1082
+
+# 仅配置指定模块
+curl -fsSL https://raw.githubusercontent.com/miauyo/proxy-config/main/proxy-config.sh | sudo bash -s -- --proxy http://10.0.0.10:1082 --targets git,npm,docker-daemon
+
+# 移除所有代理
+curl -fsSL https://raw.githubusercontent.com/miauyo/proxy-config/main/proxy-config.sh | sudo bash -s -- --remove
+```
+
+### 本地运行
+
+```bash
+# 克隆仓库
+git clone https://github.com/miauyo/proxy-config.git
+cd proxy-config
+
+# 交互模式
 sudo ./proxy-config.sh
 ```
 
