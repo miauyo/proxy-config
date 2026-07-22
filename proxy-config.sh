@@ -82,6 +82,7 @@ NO_PROXY="$DEFAULT_NO_PROXY"
 BACKUP_DIR=""
 LOG_FILE=""
 CONFIG_FILE=""
+SKIP_VERIFY=false
 
 # 统计计数器
 declare -i STAT_CONFIGURED=0
@@ -1623,13 +1624,41 @@ print_summary() {
         echo -e "    ${COLORS[cyan]}source /etc/profile.d/proxy.sh${COLORS[reset]}"
         echo ""
 
-        # 验证连通性 (可选的快速测试)
-        if command_exists curl; then
-            echo -e "  ${COLORS[dim]}快速连通性测试...${COLORS[reset]}"
-            if curl -s --max-time 5 --proxy "$(build_proxy_url)" "http://httpbin.org/ip" &>/dev/null; then
-                echo -e "  ${COLORS[green]}✓ 代理连通性测试通过${COLORS[reset]}"
-            else
-                echo -e "  ${COLORS[yellow]}⚠ 代理连通性测试失败 — 请检查代理服务器是否可达${COLORS[reset]}"
+        # 跳过验证
+        if ${SKIP_VERIFY:-false}; then
+            echo -e "  ${COLORS[dim]}连通性测试已跳过 (--skip-verify)${COLORS[reset]}"
+        elif command_exists curl; then
+            echo -e "  ${COLORS[dim]}代理连通性测试...${COLORS[reset]}"
+            local proxy_url test_url
+            proxy_url=$(build_proxy_url)
+
+            # 优先用百度 (国内快), 其次 google, 最后 cloudflare
+            for test_url in "http://www.baidu.com" "http://www.google.com" "http://1.1.1.1"; do
+                local http_code
+                http_code=$(curl -s -o /dev/null -w '%{http_code}' \
+                    --max-time 5 --proxy "$proxy_url" "$test_url" 2>/dev/null || true)
+                if [[ "$http_code" =~ ^(200|301|302|307|308)$ ]]; then
+                    echo -e "  ${COLORS[green]}✓ 代理连通性测试通过 (${test_url})${COLORS[reset]}"
+                    break
+                fi
+            done
+
+            if [[ ! "$http_code" =~ ^(200|301|302|307|308)$ ]]; then
+                # 区分: 代理不可达 vs 代理可达但目标不可达
+                local proxy_reachable
+                proxy_reachable=$(curl -s -o /dev/null -w '%{http_code}' \
+                    --max-time 3 --proxy "$proxy_url" "http://www.baidu.com" 2>/dev/null || true)
+                if [[ -z "$proxy_reachable" ]] || [[ "$proxy_reachable" == "000" ]]; then
+                    echo -e "  ${COLORS[yellow]}⚠ 代理连通性测试失败 — 无法连接到代理服务器 ${proxy_url}${COLORS[reset]}"
+                    echo -e "  ${COLORS[dim]}  请检查:${COLORS[reset]}"
+                    echo -e "  ${COLORS[dim]}  1. 代理地址和端口是否正确${COLORS[reset]}"
+                    echo -e "  ${COLORS[dim]}  2. 本机能否 ping 通代理服务器${COLORS[reset]}"
+                    echo -e "  ${COLORS[dim]}  3. 代理服务器防火墙是否放行${COLORS[reset]}"
+                else
+                    echo -e "  ${COLORS[yellow]}⚠ 代理服务器可达 (HTTP ${proxy_reachable})，但外网连通性异常${COLORS[reset]}"
+                    echo -e "  ${COLORS[dim]}  代理配置已写入，可能是代理本身限制了外网访问${COLORS[reset]}"
+                fi
+                echo -e "  ${COLORS[dim]}  可跳过此测试: --skip-verify${COLORS[reset]}"
             fi
         fi
     fi
@@ -1672,6 +1701,8 @@ print_usage() {
   --list-targets         列出所有可用模块
 
   --no-color             禁用彩色输出
+
+  --skip-verify          跳过末尾的代理连通性测试
 
   --non-interactive      非交互模式 (与 --proxy 一起使用)
 
@@ -1740,6 +1771,10 @@ parse_args() {
                 init_targets
                 list_targets
                 exit 0
+                ;;
+            --skip-verify)
+                SKIP_VERIFY=true
+                shift
                 ;;
             --non-interactive)
                 INTERACTIVE=false
