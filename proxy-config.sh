@@ -1632,22 +1632,22 @@ print_summary() {
             local proxy_url test_url
             proxy_url=$(build_proxy_url)
 
-            # 优先用百度 (国内快), 其次 google, 最后 cloudflare
-            for test_url in "http://www.baidu.com" "http://www.google.com" "http://1.1.1.1"; do
+            # 使用 gstatic.com (Google CDN, 全球可靠, 返回 204)
+            for test_url in "http://www.gstatic.com/generate_204" "http://www.baidu.com"; do
                 local http_code
                 http_code=$(curl -s -o /dev/null -w '%{http_code}' \
                     --max-time 5 --proxy "$proxy_url" "$test_url" 2>/dev/null || true)
-                if [[ "$http_code" =~ ^(200|301|302|307|308)$ ]]; then
-                    echo -e "  ${COLORS[green]}✓ 代理连通性测试通过 (${test_url})${COLORS[reset]}"
+                if [[ "$http_code" == "204" ]] || [[ "$http_code" == "200" ]]; then
+                    echo -e "  ${COLORS[green]}✓ 代理连通性测试通过 (${test_url} → ${http_code})${COLORS[reset]}"
                     break
                 fi
             done
 
-            if [[ ! "$http_code" =~ ^(200|301|302|307|308)$ ]]; then
+            if [[ "$http_code" != "204" ]] && [[ "$http_code" != "200" ]]; then
                 # 区分: 代理不可达 vs 代理可达但目标不可达
                 local proxy_reachable
                 proxy_reachable=$(curl -s -o /dev/null -w '%{http_code}' \
-                    --max-time 3 --proxy "$proxy_url" "http://www.baidu.com" 2>/dev/null || true)
+                    --max-time 3 --proxy "$proxy_url" "http://www.gstatic.com/generate_204" 2>/dev/null || true)
                 if [[ -z "$proxy_reachable" ]] || [[ "$proxy_reachable" == "000" ]]; then
                     echo -e "  ${COLORS[yellow]}⚠ 代理连通性测试失败 — 无法连接到代理服务器 ${proxy_url}${COLORS[reset]}"
                     echo -e "  ${COLORS[dim]}  请检查:${COLORS[reset]}"
