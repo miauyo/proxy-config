@@ -1588,6 +1588,55 @@ run_all_configurations() {
 }
 
 #===============================================================================
+# 代理连通性测试
+#===============================================================================
+verify_connectivity() {
+    if $DRY_RUN || $REMOVE_MODE; then return 0; fi
+    if ${SKIP_VERIFY:-false}; then
+        print_info "连通性测试已跳过 (--skip-verify)"
+        return 0
+    fi
+    if ! command_exists curl; then return 0; fi
+
+    local proxy_url
+    proxy_url=$(build_proxy_url)
+
+    echo ""
+    print_info "代理连通性测试..."
+
+    # 临时关闭 set -e，curl 失败不应导致脚本退出
+    set +e
+    local http_code
+    http_code=$(curl -s -o /dev/null -w '%{http_code}' \
+        --max-time 5 --proxy "$proxy_url" "http://www.gstatic.com/generate_204" 2>/dev/null || true)
+    set -e
+
+    if [[ "$http_code" == "204" ]] || [[ "$http_code" == "200" ]]; then
+        log_success "代理连通性测试通过 (gstatic.com → ${http_code})"
+        return 0
+    fi
+
+    # 区分: 代理不可达 vs 代理可达但目标不可达
+    set +e
+    local proxy_reachable
+    proxy_reachable=$(curl -s -o /dev/null -w '%{http_code}' \
+        --max-time 3 --proxy "$proxy_url" "http://www.gstatic.com/generate_204" 2>/dev/null || true)
+    set -e
+
+    if [[ -z "$proxy_reachable" ]] || [[ "$proxy_reachable" == "000" ]]; then
+        log_warn "代理连通性测试失败 — 无法连接到代理服务器 ${proxy_url}"
+        print_info "请检查:"
+        print_info "  1. 代理地址和端口是否正确"
+        print_info "  2. 本机能否 ping 通代理服务器"
+        print_info "  3. 代理服务器防火墙是否放行"
+    else
+        log_warn "代理服务器可达 (HTTP ${proxy_reachable})，但外网连通性异常"
+        print_info "代理配置已写入，可能是代理本身限制了外网访问"
+    fi
+    print_info "可跳过此测试: --skip-verify"
+}
+
+#===============================================================================
 # 打印执行总结
 #===============================================================================
 print_summary() {
@@ -1623,38 +1672,6 @@ print_summary() {
         echo -e "  如需在当前终端立即生效，请执行:"
         echo -e "    ${COLORS[cyan]}source /etc/profile.d/proxy.sh${COLORS[reset]}"
         echo ""
-
-        # 跳过验证
-        if ${SKIP_VERIFY:-false}; then
-            echo -e "  ${COLORS[dim]}连通性测试已跳过 (--skip-verify)${COLORS[reset]}"
-        elif command_exists curl; then
-            echo -e "  ${COLORS[dim]}代理连通性测试...${COLORS[reset]}"
-            local proxy_url test_url
-            proxy_url=$(build_proxy_url)
-
-            # gstatic.com/generate_204: Google CDN, 全球可靠, 返回 204 No Content
-            local http_code
-            http_code=$(curl -s -o /dev/null -w '%{http_code}' \
-                --max-time 5 --proxy "$proxy_url" "http://www.gstatic.com/generate_204" 2>/dev/null || true)
-
-            if [[ "$http_code" != "204" ]] && [[ "$http_code" != "200" ]]; then
-                # 区分: 代理不可达 vs 代理可达但目标不可达
-                local proxy_reachable
-                proxy_reachable=$(curl -s -o /dev/null -w '%{http_code}' \
-                    --max-time 3 --proxy "$proxy_url" "http://www.gstatic.com/generate_204" 2>/dev/null || true)
-                if [[ -z "$proxy_reachable" ]] || [[ "$proxy_reachable" == "000" ]]; then
-                    echo -e "  ${COLORS[yellow]}⚠ 代理连通性测试失败 — 无法连接到代理服务器 ${proxy_url}${COLORS[reset]}"
-                    echo -e "  ${COLORS[dim]}  请检查:${COLORS[reset]}"
-                    echo -e "  ${COLORS[dim]}  1. 代理地址和端口是否正确${COLORS[reset]}"
-                    echo -e "  ${COLORS[dim]}  2. 本机能否 ping 通代理服务器${COLORS[reset]}"
-                    echo -e "  ${COLORS[dim]}  3. 代理服务器防火墙是否放行${COLORS[reset]}"
-                else
-                    echo -e "  ${COLORS[yellow]}⚠ 代理服务器可达 (HTTP ${proxy_reachable})，但外网连通性异常${COLORS[reset]}"
-                    echo -e "  ${COLORS[dim]}  代理配置已写入，可能是代理本身限制了外网访问${COLORS[reset]}"
-                fi
-                echo -e "  ${COLORS[dim]}  可跳过此测试: --skip-verify${COLORS[reset]}"
-            fi
-        fi
     fi
 
     if $REMOVE_MODE; then
@@ -1955,6 +1972,9 @@ main() {
 
     # 打印总结
     print_summary
+
+    # 连通性测试 (在总结之后)
+    verify_connectivity
 
     log_to_file "========== proxy-config.sh 结束 =========="
 
