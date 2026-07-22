@@ -523,62 +523,112 @@ init_targets() {
     fi
 }
 
-# 交互模式下用户勾选模块
+# 交互模式下用户勾选模块 (TUI 方向键操作)
 select_targets_interactive() {
-    echo ""
-    echo -e "${COLORS[bold]}选择要配置的模块 (默认全选):${COLORS[reset]}"
-    echo -e "  输入编号反选，如 ${COLORS[cyan]}1,3,5${COLORS[reset]} 取消/恢复对应模块"
-    echo -e "  直接按 ${COLORS[cyan]}回车${COLORS[reset]} 确认全部"
-    echo ""
+    if [[ ! -t 0 ]]; then
+        log_warn "终端不支持交互式选择，使用全部已安装模块"
+        return 0
+    fi
 
     local available_keys=()
-    local idx=1
-    declare -A idx_to_key
-
     for t in "${MODULE_ORDER[@]}"; do
         if ${TARGET_AVAILABLE[$t]}; then
             available_keys+=("$t")
-            idx_to_key[$idx]="$t"
-            local desc="${TARGET_DESCRIPTIONS[$t]:-$t}"
-            local mark
-            if ${TARGET_ENABLED[$t]}; then
-                mark="${COLORS[green]}✓${COLORS[reset]}"
-            else
-                mark="${COLORS[dim]}✗${COLORS[reset]}"
-            fi
-            printf "  ${COLORS[bold]}%2d${COLORS[reset]}. %s %s\n" "$idx" "$mark" "$desc"
-            idx=$((idx + 1))
         fi
     done
+    local total=${#available_keys[@]}
 
-    echo ""
-    read -r -p "  取消/恢复哪些模块? [直接回车=全选]: " deselection
-
-    if [[ -n "$deselection" ]]; then
-        IFS=',' read -ra deselected <<< "$deselection"
-        for num in "${deselected[@]}"; do
-            num="${num//[[:space:]]/}"
-            if [[ "$num" =~ ^[0-9]+$ ]] && [[ -n "${idx_to_key[$num]:-}" ]]; then
-                local key="${idx_to_key[$num]}"
-                # 反选
-                if ${TARGET_ENABLED[$key]}; then
-                    TARGET_ENABLED[$key]=false
-                else
-                    TARGET_ENABLED[$key]=true
-                fi
-            fi
-        done
+    if [[ $total -eq 0 ]]; then
+        log_warn "没有检测到可配置的模块"
+        return 0
     fi
 
-    # 打印最终选择
-    echo ""
+    # 终端控制序列
+    local ESC=$'\033'
+    local CUU="${ESC}[A"       # cursor up
+    local CUD="${ESC}[B"       # cursor down
+    local CUF="${ESC}[C"       # cursor forward
+    local EL="${ESC}[K"        # erase to end of line
+    local REV="${ESC}[7m"      # reverse video
+    local SGR0="${ESC}[0m"     # reset all attributes
+    local DIM="${ESC}[2m"      # dim
+    local GREEN="${ESC}[32m"   # green
+    local HIDE_CURSOR="${ESC}[?25l"
+    local SHOW_CURSOR="${ESC}[?25h"
+
+    # 进入原始模式
+    local saved_stty
+    saved_stty=$(stty -g 2>/dev/null)
+    stty -echo -icanon -ixon min 1 time 0 2>/dev/null
+    trap 'stty "$saved_stty" 2>/dev/null; printf "${SHOW_CURSOR}\n"' RETURN
+    printf '%s' "$HIDE_CURSOR"
+
+    local cursor=0
+
+    # 打印头部
+    echo -e "\n${COLORS[bold]}选择要配置的模块:${COLORS[reset]}"
+    echo -e "  ${COLORS[dim]}↑↓ 移动  ${COLORS[cyan]}空格${COLORS[reset]}${COLORS[dim]} 勾选/取消  ${COLORS[cyan]}回车${COLORS[reset]}${COLORS[dim]} 确认  ${COLORS[cyan]}q${COLORS[reset]}${COLORS[dim]} 全选退出${COLORS[reset]}"
+
+    # 渲染函数 — 每次调用重绘全部 item
+    _tui_render() {
+        local i t desc mark line
+        for ((i = 0; i < total; i++)); do
+            t="${available_keys[$i]}"
+            desc="${TARGET_DESCRIPTIONS[$t]:-$t}"
+
+            if ${TARGET_ENABLED[$t]}; then
+                mark="${GREEN}[✓]${SGR0}"
+            else
+                mark="${DIM}[ ]${SGR0}"
+            fi
+
+            # 构建整行
+            if [[ $i -eq $cursor ]]; then
+                line="${REV}  ${mark} ${desc} ${SGR0}${EL}"
+            else
+                line="  ${mark} ${desc}${EL}"
+            fi
+
+            printf '%s\r\n' "$line"
+        done
+        # 回到列表第一行
+        printf "${CUU}%.0s" $(seq 1 $total)
+    }
+
+    _tui_render
+
+    while true; do
+        local key key2 key3
+        IFS= read -s -r -n 1 key
+
+        case "$key" in
+            $'\033')
+                read -s -r -n 1 -t 0.01 key2 2>/dev/null || true
+                if [[ "$key2" == "[" ]]; then
+                    read -s -r -n 1 -t 0.01 key3 2>/dev/null || true
+                    case "$key3" in
+                        A) [[ $cursor -gt 0 ]] && cursor=$((cursor - 1)) ;;
+                        B) [[ $cursor -lt $((total - 1)) ]] && cursor=$((cursor + 1)) ;;
+                    esac
+                fi
+                ;;
+            " ")
+                local ct="${available_keys[$cursor]}"
+                ${TARGET_ENABLED[$ct]} && TARGET_ENABLED[$ct]=false || TARGET_ENABLED[$ct]=true
+                ;;
+            ""|$'\n') break ;;   # 回车确认
+            q|Q) for ct in "${available_keys[@]}"; do TARGET_ENABLED[$ct]=true; done; break ;;
+        esac
+        _tui_render
+    done
+
+    # trap RETURN 恢复终端并显示光标
     local selected_count=0
     for t in "${available_keys[@]}"; do
-        if ${TARGET_ENABLED[$t]}; then
-            selected_count=$((selected_count + 1))
-        fi
+        ${TARGET_ENABLED[$t]} && selected_count=$((selected_count + 1))
     done
-    print_info "已选择 ${COLORS[bold]}${selected_count}${COLORS[reset]} / ${#available_keys[@]} 个模块"
+    echo ""
+    print_info "已选择 ${COLORS[bold]}${selected_count}${COLORS[reset]} / ${total} 个模块"
 }
 
 #===============================================================================
