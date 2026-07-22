@@ -1632,16 +1632,10 @@ print_summary() {
             local proxy_url test_url
             proxy_url=$(build_proxy_url)
 
-            # 使用 gstatic.com (Google CDN, 全球可靠, 返回 204)
-            for test_url in "http://www.gstatic.com/generate_204" "http://www.baidu.com"; do
-                local http_code
-                http_code=$(curl -s -o /dev/null -w '%{http_code}' \
-                    --max-time 5 --proxy "$proxy_url" "$test_url" 2>/dev/null || true)
-                if [[ "$http_code" == "204" ]] || [[ "$http_code" == "200" ]]; then
-                    echo -e "  ${COLORS[green]}✓ 代理连通性测试通过 (${test_url} → ${http_code})${COLORS[reset]}"
-                    break
-                fi
-            done
+            # gstatic.com/generate_204: Google CDN, 全球可靠, 返回 204 No Content
+            local http_code
+            http_code=$(curl -s -o /dev/null -w '%{http_code}' \
+                --max-time 5 --proxy "$proxy_url" "http://www.gstatic.com/generate_204" 2>/dev/null || true)
 
             if [[ "$http_code" != "204" ]] && [[ "$http_code" != "200" ]]; then
                 # 区分: 代理不可达 vs 代理可达但目标不可达
