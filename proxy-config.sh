@@ -1106,7 +1106,7 @@ configure_npm() {
 
     if $REMOVE_MODE; then
         local changed=false
-        for key in proxy https-proxy no-proxy; do
+        for key in proxy https-proxy noproxy; do
             if npm config get "$key" &>/dev/null && [[ "$(npm config get "$key" 2>/dev/null)" != "null" ]]; then
                 if ! $DRY_RUN; then
                     npm config delete "$key" 2>/dev/null || true
@@ -1127,7 +1127,7 @@ configure_npm() {
     if $DRY_RUN; then
         print_dryrun "npm config set proxy \"${proxy_url}\""
         print_dryrun "npm config set https-proxy \"${proxy_url}\""
-        print_dryrun "npm config set no-proxy \"${NO_PROXY}\""
+        print_dryrun "npm config set noproxy \"${NO_PROXY}\""
         STAT_CONFIGURED=$((STAT_CONFIGURED + 1))
         return 0
     fi
@@ -1135,7 +1135,7 @@ configure_npm() {
     local ok=true
     npm config set proxy "$proxy_url" 2>/dev/null || ok=false
     npm config set https-proxy "$proxy_url" 2>/dev/null || ok=false
-    npm config set no-proxy "$NO_PROXY" 2>/dev/null || ok=false
+    npm config set noproxy "$NO_PROXY" 2>/dev/null || ok=false
 
     if $ok; then
         log_success "npm 代理 — 配置完成"
