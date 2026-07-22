@@ -136,19 +136,15 @@ declare -A TARGET_AVAILABLE
 # 用户通过 --targets 指定的列表（空=全部）
 TARGETS_FILTER=""
 
-# 真实用户检测 (sudo 环境下 $HOME 可能是 /root)
-if [[ -n "${SUDO_USER:-}" ]] && is_root; then
-    REAL_USER="$SUDO_USER"
-    REAL_HOME=$(getent passwd "$REAL_USER" 2>/dev/null | cut -d: -f6)
-    [[ -z "$REAL_HOME" ]] && REAL_HOME="/home/$REAL_USER"
-else
-    REAL_USER="$(whoami)"
-    REAL_HOME="$HOME"
-fi
+#===============================================================================
+# 工具函数 (必须在任何调用之前定义, curl|bash 管道模式下按序解析)
+#===============================================================================
 
-#===============================================================================
-# 工具函数
-#===============================================================================
+# 检查是否以 root 运行
+is_root() { [[ $EUID -eq 0 ]]; }
+
+# 检查命令是否存在
+command_exists() { command -v "$1" &>/dev/null; }
 
 # 输出信息
 print_info()    { echo -e "${COLORS[blue]}[INFO]${COLORS[reset]}    $*"; }
@@ -170,11 +166,15 @@ log_success() { print_success "$@"; log_to_file "[OK] $*"; }
 log_warn()    { print_warn "$@";    log_to_file "[WARN] $*"; }
 log_error()   { print_error "$@";   log_to_file "[ERROR] $*"; }
 
-# 检查是否以 root 运行
-is_root() { [[ $EUID -eq 0 ]]; }
-
-# 检查命令是否存在
-command_exists() { command -v "$1" &>/dev/null; }
+# 真实用户检测 (sudo 环境下 $HOME 可能是 /root)
+if [[ -n "${SUDO_USER:-}" ]] && is_root; then
+    REAL_USER="$SUDO_USER"
+    REAL_HOME=$(getent passwd "$REAL_USER" 2>/dev/null | cut -d: -f6)
+    [[ -z "$REAL_HOME" ]] && REAL_HOME="/home/$REAL_USER"
+else
+    REAL_USER="$(whoami)"
+    REAL_HOME="$HOME"
+fi
 
 # 获取适合当前用户的 sudo 包装器
 sudo_wrap() {
@@ -1785,8 +1785,8 @@ print_usage() {
 
   --dry-run, -n          模拟运行 — 仅显示将要执行的操作，不做实际更改
 
-  --backup-dir <DIR>     备份目录 (默认: 系统文件 ${SYSTEM_BACKUP_DIR}
-                         用户文件 ${USER_BACKUP_DIR})
+  --backup-dir <DIR>     备份目录 (默认: /var/backups/proxy-config
+                         或 ~/.local/share/proxy-config/backups)
 
   --log-file <FILE>      日志文件路径 (默认: 自动选择)
 
