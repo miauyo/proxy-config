@@ -547,9 +547,8 @@ select_targets_interactive() {
     # 终端控制序列
     local ESC=$'\033'
     local CUU="${ESC}[A"       # cursor up
-    local CUD="${ESC}[B"       # cursor down
-    local CUF="${ESC}[C"       # cursor forward
     local EL="${ESC}[K"        # erase to end of line
+    local ED="${ESC}[J"        # erase to end of display
     local REV="${ESC}[7m"      # reverse video
     local SGR0="${ESC}[0m"     # reset all attributes
     local DIM="${ESC}[2m"      # dim
@@ -561,16 +560,28 @@ select_targets_interactive() {
     local saved_stty
     saved_stty=$(stty -g 2>/dev/null)
     stty -echo -icanon -ixon min 1 time 0 2>/dev/null
-    trap 'stty "$saved_stty" 2>/dev/null; printf "${SHOW_CURSOR}\n"' RETURN
+
+    # 清理函数: 恢复终端, 光标移至列表下方
+    _tui_cleanup() {
+        stty "$saved_stty" 2>/dev/null
+        printf '%s' "$SHOW_CURSOR"
+        # 光标移到列表底部下方 (预留 2 行间距)
+        printf '\n%.0s' $(seq 1 $((total + 2)))
+    }
+    trap '_tui_cleanup' RETURN
     printf '%s' "$HIDE_CURSOR"
 
     local cursor=0
 
-    # 打印头部
+    # 打印头部和占位行
     echo -e "\n${COLORS[bold]}选择要配置的模块:${COLORS[reset]}"
     echo -e "  ${COLORS[dim]}↑↓ 移动  ${COLORS[cyan]}空格${COLORS[reset]}${COLORS[dim]} 勾选/取消  ${COLORS[cyan]}回车${COLORS[reset]}${COLORS[dim]} 确认  ${COLORS[cyan]}q${COLORS[reset]}${COLORS[dim]} 全选退出${COLORS[reset]}"
+    # 预留 total 行空白给列表
+    for ((i = 0; i < total; i++)); do echo ""; done
+    # 回到占位区第一行
+    printf "${CUU}%.0s" $(seq 1 $total)
 
-    # 渲染函数 — 每次调用重绘全部 item
+    # 渲染函数: 在预留区域重绘全部 item
     _tui_render() {
         local i t desc mark line
         for ((i = 0; i < total; i++)); do
@@ -583,7 +594,6 @@ select_targets_interactive() {
                 mark="${DIM}[ ]${SGR0}"
             fi
 
-            # 构建整行
             if [[ $i -eq $cursor ]]; then
                 line="${REV}  ${mark} ${desc} ${SGR0}${EL}"
             else
@@ -592,7 +602,7 @@ select_targets_interactive() {
 
             printf '%s\r\n' "$line"
         done
-        # 回到列表第一行
+        # 回到第一行, 等待下次渲染覆盖
         printf "${CUU}%.0s" $(seq 1 $total)
     }
 
@@ -617,19 +627,13 @@ select_targets_interactive() {
                 local ct="${available_keys[$cursor]}"
                 ${TARGET_ENABLED[$ct]} && TARGET_ENABLED[$ct]=false || TARGET_ENABLED[$ct]=true
                 ;;
-            ""|$'\n') break ;;   # 回车确认
+            ""|$'\n') break ;;
             q|Q) for ct in "${available_keys[@]}"; do TARGET_ENABLED[$ct]=true; done; break ;;
         esac
         _tui_render
     done
 
-    # trap RETURN 恢复终端并显示光标
-    local selected_count=0
-    for t in "${available_keys[@]}"; do
-        ${TARGET_ENABLED[$t]} && selected_count=$((selected_count + 1))
-    done
-    echo ""
-    print_info "已选择 ${COLORS[bold]}${selected_count}${COLORS[reset]} / ${total} 个模块"
+    # trap RETURN 触发 _tui_cleanup: 恢复终端 + 清除列表区域
 }
 
 #===============================================================================
