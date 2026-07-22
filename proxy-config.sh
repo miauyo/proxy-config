@@ -29,20 +29,17 @@ set -euo pipefail
 #===============================================================================
 readonly SCRIPT_NAME="proxy-config"
 readonly SCRIPT_VERSION="1.0.0"
-readonly SCRIPT_URL="https://github.com/example/proxy-config"
+readonly SCRIPT_URL="https://github.com/miauyo/proxy-config"
+readonly TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
 # 由本脚本管理的文件标记
 readonly MARKER="# Managed by proxy-config.sh — do not edit manually"
 readonly MARKER_START="# >>> proxy-config.sh managed block >>>"
 readonly MARKER_END="# <<< proxy-config.sh managed block <<<"
 
-# 默认备份目录
+# 默认备份目录 (用户级路径在 initialize() 中根据 REAL_HOME 计算)
 readonly SYSTEM_BACKUP_DIR="/var/backups/proxy-config"
-readonly USER_BACKUP_DIR="${HOME}/.local/share/proxy-config/backups"
-
-# 日志文件
 readonly SYSTEM_LOG_DIR="/var/log"
-readonly USER_LOG_DIR="${HOME}/.local/share/proxy-config"
 
 #===============================================================================
 # 颜色定义
@@ -80,10 +77,10 @@ PROXY_PORT=""
 PROXY_PROTO="http"
 PROXY_USER=""
 PROXY_PASS=""
-NO_PROXY="localhost,127.0.0.1,::1,.local,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12"
+readonly DEFAULT_NO_PROXY="localhost,127.0.0.1,::1,.local,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12"
+NO_PROXY="$DEFAULT_NO_PROXY"
 BACKUP_DIR=""
 LOG_FILE=""
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 CONFIG_FILE=""
 
 # 统计计数器
@@ -137,6 +134,16 @@ declare -A TARGET_ENABLED
 declare -A TARGET_AVAILABLE
 # 用户通过 --targets 指定的列表（空=全部）
 TARGETS_FILTER=""
+
+# 真实用户检测 (sudo 环境下 $HOME 可能是 /root)
+if [[ -n "${SUDO_USER:-}" ]] && is_root; then
+    REAL_USER="$SUDO_USER"
+    REAL_HOME=$(getent passwd "$REAL_USER" 2>/dev/null | cut -d: -f6)
+    [[ -z "$REAL_HOME" ]] && REAL_HOME="/home/$REAL_USER"
+else
+    REAL_USER="$(whoami)"
+    REAL_HOME="$HOME"
+fi
 
 #===============================================================================
 # 工具函数
@@ -251,7 +258,7 @@ write_file() {
 
     # 用户 home 目录下的文件不通过 sudo 写入，避免 root 属主问题
     local write_cmd="tee"
-    if [[ "$file" != "$HOME"* ]]; then
+    if [[ "$file" != "${REAL_HOME}"* ]]; then
         write_cmd="sudo_wrap tee"
     fi
     if echo "$content" | $write_cmd "$file" > /dev/null 2>&1; then
@@ -340,6 +347,15 @@ validate_proxy_url() {
     else
         log_error "无法解析代理地址: $url"
         return 1
+    fi
+
+    # 验证认证信息：防止注入到 shell 脚本中的特殊字符
+    if [[ -n "$PROXY_USER" ]]; then
+        if [[ "$PROXY_USER" =~ [\`\$\!\"\\] ]] || [[ -n "$PROXY_PASS" && "$PROXY_PASS" =~ [\`\$\!\"\\] ]]; then
+            log_error "代理认证信息包含不安全的字符 (\` \$ ! \" \\)"
+            log_error "请对用户名/密码进行 URL 编码后再使用"
+            return 1
+        fi
     fi
 
     # 验证 host
@@ -486,7 +502,7 @@ init_targets() {
     if [[ -n "$TARGETS_FILTER" ]]; then
         IFS=',' read -ra wanted <<< "$TARGETS_FILTER"
         for t in "${wanted[@]}"; do
-            t=$(echo "$t" | xargs)
+            t="${t//[[:space:]]/}"
             [[ -z "$t" ]] && continue
             if [[ -n "${TARGET_HANDLERS[$t]:-}" ]]; then
                 if ${TARGET_AVAILABLE[$t]}; then
@@ -541,7 +557,7 @@ select_targets_interactive() {
     if [[ -n "$deselection" ]]; then
         IFS=',' read -ra deselected <<< "$deselection"
         for num in "${deselected[@]}"; do
-            num=$(echo "$num" | xargs)
+            num="${num//[[:space:]]/}"
             if [[ "$num" =~ ^[0-9]+$ ]] && [[ -n "${idx_to_key[$num]:-}" ]]; then
                 local key="${idx_to_key[$num]}"
                 # 反选
@@ -812,7 +828,7 @@ configure_docker_client() {
 
     print_header "Docker 客户端"
 
-    local docker_config="${HOME}/.docker/config.json"
+    local docker_config="${REAL_HOME}/.docker/config.json"
     local proxy_url
     proxy_url=$(build_proxy_url)
 
@@ -1051,14 +1067,8 @@ configure_pip() {
     local proxy_url
     proxy_url=$(build_proxy_url)
 
-    # pip 配置文件路径优先级
-    local pip_conf=""
-    if [[ -d /etc/pip.conf ]]; then
-        : # /etc/pip.conf 是目录不是文件的情况
-    fi
-
-    # 全局配置
-    pip_conf="/etc/pip.conf"
+    # 全局 pip 配置
+    local pip_conf="/etc/pip.conf"
 
     if $REMOVE_MODE; then
         # 移除全局 pip 配置中的代理
@@ -1076,14 +1086,14 @@ configure_pip() {
         fi
 
         # 也清理用户级配置
-        for user_conf in "${HOME}/.config/pip/pip.conf" "${HOME}/.pip/pip.conf"; do
+        for user_conf in "${REAL_HOME}/.config/pip/pip.conf" "${REAL_HOME}/.pip/pip.conf"; do
             if [[ -f "$user_conf" ]]; then
                 local cleaned
                 cleaned=$(grep -vE '^\s*proxy\s*=' "$user_conf" 2>/dev/null || true)
                 if [[ -z "$(echo "$cleaned" | tr -d '[:space:]')" ]]; then
-                    rm "$user_conf" 2>/dev/null || true
+                    remove_file "$user_conf" "pip 用户级代理"
                 else
-                    echo "$cleaned" > "$user_conf"
+                    write_file "$user_conf" "$cleaned" "pip 用户级代理 (移除代理)"
                 fi
             fi
         done
@@ -1121,7 +1131,7 @@ configure_curl() {
 
     print_header "curl"
 
-    local curlrc="${HOME}/.curlrc"
+    local curlrc="${REAL_HOME}/.curlrc"
     local proxy_url
     proxy_url=$(build_proxy_url)
 
@@ -1131,13 +1141,10 @@ configure_curl() {
             local cleaned
             cleaned=$(grep -vE '^[[:space:]]*(proxy|noproxy)[[:space:]]*=' "$curlrc" 2>/dev/null || true)
             if [[ -z "$(echo "$cleaned" | tr -d '[:space:]')" ]]; then
-                rm "$curlrc" 2>/dev/null || true
-                log_success "curl 代理 — 已移除 (~/.curlrc 已删除)"
+                remove_file "$curlrc" "curl 代理 (~/.curlrc)"
             else
-                echo "$cleaned" > "$curlrc"
-                log_success "curl 代理 — 已从 ~/.curlrc 移除"
+                write_file "$curlrc" "$cleaned" "curl 代理 (移除 ~/.curlrc)"
             fi
-            STAT_CONFIGURED=$((STAT_CONFIGURED + 1))
         else
             log_info "curl 配置不存在，跳过"
             STAT_SKIPPED=$((STAT_SKIPPED + 1))
@@ -1394,6 +1401,14 @@ configure_current_shell() {
 # 交互模式
 #===============================================================================
 run_interactive() {
+    # 检查是否有可用的终端输入
+    if [[ ! -t 0 ]]; then
+        log_error "交互模式需要终端输入 (stdin 不是 TTY)"
+        log_error "请使用命令行模式: --proxy <URL>"
+        log_error "或重定向终端:  </dev/tty sudo ./proxy-config.sh"
+        exit 1
+    fi
+
     echo -e "${COLORS[bold]}${COLORS[cyan]}"
     echo "╔══════════════════════════════════════════════════════╗"
     echo "║       Linux 全局代理配置工具 v${SCRIPT_VERSION}                   ║"
@@ -1534,6 +1549,10 @@ print_summary() {
     echo -e "  ${COLORS[yellow]}已跳过:${COLORS[reset]} ${STAT_SKIPPED}"
     echo -e "  ${COLORS[red]}失败:${COLORS[reset]}   ${STAT_FAILED}"
     echo -e "  ${COLORS[blue]}备份:${COLORS[reset]}   ${STAT_BACKED_UP}"
+    if [[ $STAT_BACKED_UP -gt 0 ]]; then
+        echo -e "  ${COLORS[dim]}备份目录: ${BACKUP_DIR}${COLORS[reset]}"
+        echo -e "  ${COLORS[dim]}清理旧备份: find ${BACKUP_DIR} -name '*.bak' -mtime +30 -delete${COLORS[reset]}"
+    fi
     echo ""
 
     if $DRY_RUN; then
@@ -1736,7 +1755,7 @@ load_config_file() {
                 fi
                 ;;
             NO_PROXY)
-                if [[ -z "$NO_PROXY" ]] || [[ "$NO_PROXY" == "localhost,127.0.0.1,::1,.local,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12" ]]; then
+                if [[ -z "$NO_PROXY" ]] || [[ "$NO_PROXY" == "$DEFAULT_NO_PROXY" ]]; then
                     NO_PROXY="$value"
                 fi
                 ;;
@@ -1750,21 +1769,25 @@ load_config_file() {
 # 初始化
 #===============================================================================
 initialize() {
+    # 计算用户级路径 (基于真实用户 HOME，不是 root 的 HOME)
+    local user_backup_dir="${REAL_HOME}/.local/share/proxy-config/backups"
+    local user_log_dir="${REAL_HOME}/.local/share/proxy-config"
+
     # 确定备份目录
     if [[ -z "$BACKUP_DIR" ]]; then
-        if is_root; then
+        if is_root && [[ -z "${SUDO_USER:-}" ]]; then
             BACKUP_DIR="$SYSTEM_BACKUP_DIR"
         else
-            BACKUP_DIR="$USER_BACKUP_DIR"
+            BACKUP_DIR="$user_backup_dir"
         fi
     fi
 
     # 确定日志文件
     if [[ -z "$LOG_FILE" ]]; then
-        if is_root; then
+        if is_root && [[ -z "${SUDO_USER:-}" ]]; then
             LOG_FILE="${SYSTEM_LOG_DIR}/${SCRIPT_NAME}.log"
         else
-            LOG_FILE="${USER_LOG_DIR}/${SCRIPT_NAME}.log"
+            LOG_FILE="${user_log_dir}/${SCRIPT_NAME}.log"
         fi
     fi
 
