@@ -77,7 +77,7 @@ PROXY_PORT=""
 PROXY_PROTO="http"
 PROXY_USER=""
 PROXY_PASS=""
-readonly DEFAULT_NO_PROXY="localhost,127.0.0.1,::1,.local,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12"
+readonly DEFAULT_NO_PROXY="localhost,127.0.0.1,::1,.local,.internal,.svc,.cluster.local,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12"
 NO_PROXY="$DEFAULT_NO_PROXY"
 BACKUP_DIR=""
 LOG_FILE=""
@@ -689,23 +689,28 @@ export HTTP_PROXY="${proxy_url}"
 export HTTPS_PROXY="${proxy_url}"
 export FTP_PROXY="${proxy_url}"
 export NO_PROXY="${NO_PROXY}"
+export ALL_PROXY="${proxy_url}"
+export RSYNC_PROXY="${proxy_url}"
 EOF
 )
     write_file /etc/profile.d/proxy.sh "$proxy_script" "系统代理脚本 /etc/profile.d/proxy.sh"
     sudo_wrap chmod 644 /etc/profile.d/proxy.sh 2>/dev/null || true
 
-    # 同时配置 /etc/environment (PAM 使用)
+    # 同时配置 /etc/environment (PAM 使用, 注意: pam_env.so 不支持引号)
     local env_vars
     env_vars=$(cat <<EOF
 ${MARKER}
-HTTP_PROXY="${proxy_url}"
-HTTPS_PROXY="${proxy_url}"
-FTP_PROXY="${proxy_url}"
-NO_PROXY="${NO_PROXY}"
-http_proxy="${proxy_url}"
-https_proxy="${proxy_url}"
-ftp_proxy="${proxy_url}"
-no_proxy="${NO_PROXY}"
+HTTP_PROXY=${proxy_url}
+HTTPS_PROXY=${proxy_url}
+FTP_PROXY=${proxy_url}
+NO_PROXY=${NO_PROXY}
+http_proxy=${proxy_url}
+https_proxy=${proxy_url}
+ftp_proxy=${proxy_url}
+no_proxy=${NO_PROXY}
+ALL_PROXY=${proxy_url}
+all_proxy=${proxy_url}
+RSYNC_PROXY=${proxy_url}
 EOF
 )
 
@@ -771,40 +776,66 @@ configure_dnf() {
 
     local proxy_url
     proxy_url=$(build_proxy_url)
-    local conf_file
+
+    # DNF5 (Fedora 41+, RHEL 10+) 使用 drop-in 目录
+    # DNF4 / YUM 编辑主配置文件
+    local drop_in=""
+    local legacy_conf=""
 
     if [[ "$pkg_manager" == "dnf" ]]; then
-        conf_file="/etc/dnf/dnf.conf"
+        # 检查是否存在 DNF5 drop-in 目录
+        if [[ -d /etc/dnf/libdnf5.conf.d ]] || dnf --version 2>/dev/null | grep -q 'dnf5'; then
+            drop_in="/etc/dnf/libdnf5.conf.d/99-proxy.conf"
+        else
+            legacy_conf="/etc/dnf/dnf.conf"
+        fi
     else
-        conf_file="/etc/yum.conf"
+        legacy_conf="/etc/yum.conf"
     fi
 
+    local content
+    content=$(cat <<EOF
+${MARKER}
+proxy=${proxy_url}
+EOF
+)
+
     if $REMOVE_MODE; then
-        if [[ -f "$conf_file" ]]; then
+        if [[ -n "$drop_in" ]]; then
+            if [[ -f "$drop_in" ]]; then
+                remove_file "$drop_in" "DNF5 代理配置"
+            else
+                log_info "DNF5 代理配置不存在，跳过"
+                STAT_SKIPPED=$((STAT_SKIPPED + 1))
+            fi
+        fi
+        if [[ -n "$legacy_conf" ]] && [[ -f "$legacy_conf" ]]; then
             local cleaned
-            cleaned=$(grep -v '^proxy=' "$conf_file" 2>/dev/null || true)
-            write_file "$conf_file" "$cleaned" "$conf_file (移除代理)"
-        else
-            log_info "$conf_file 不存在，跳过"
+            cleaned=$(grep -v '^proxy=' "$legacy_conf" 2>/dev/null || true)
+            write_file "$legacy_conf" "$cleaned" "$legacy_conf (移除代理)"
+        elif [[ -z "$drop_in" ]]; then
+            log_info "$legacy_conf 不存在，跳过"
             STAT_SKIPPED=$((STAT_SKIPPED + 1))
         fi
         return 0
     fi
 
-    # 读取现有配置，替换或追加 proxy 行
-    local content
-    if [[ -f "$conf_file" ]]; then
-        content=$(cat "$conf_file")
-        if grep -q '^proxy=' "$conf_file" 2>/dev/null; then
-            content=$(echo "$content" | sed "s|^proxy=.*|proxy=${proxy_url}|")
+    if [[ -n "$drop_in" ]]; then
+        write_file "$drop_in" "$content" "DNF5 代理配置 (drop-in)"
+    elif [[ -n "$legacy_conf" ]]; then
+        local existing
+        if [[ -f "$legacy_conf" ]]; then
+            existing=$(cat "$legacy_conf")
+            if grep -q '^proxy=' "$legacy_conf" 2>/dev/null; then
+                existing=$(echo "$existing" | sed "s|^proxy=.*|proxy=${proxy_url}|")
+            else
+                existing+=$'\n'"$content"
+            fi
         else
-            content+=$'\n'"${MARKER}"$'\n'"proxy=${proxy_url}"
+            existing="$content"
         fi
-    else
-        content="${MARKER}"$'\n'"proxy=${proxy_url}"
+        write_file "$legacy_conf" "$existing" "DNF/YUM 代理配置"
     fi
-
-    write_file "$conf_file" "$content" "DNF/YUM 代理配置"
 }
 
 #---------------------------------------------------------------------------
@@ -852,6 +883,9 @@ ${MARKER}
 Environment="HTTP_PROXY=${proxy_url}"
 Environment="HTTPS_PROXY=${proxy_url}"
 Environment="NO_PROXY=${NO_PROXY}"
+Environment="http_proxy=${proxy_url}"
+Environment="https_proxy=${proxy_url}"
+Environment="no_proxy=${NO_PROXY}"
 EOF
 )
     write_file "$docker_conf" "$content" "Docker 守护进程代理"
@@ -1020,6 +1054,9 @@ configure_git() {
             fi
             changed=true
         fi
+        if git config --global --get http.proxyAuthMethod &>/dev/null; then
+            git config --global --unset http.proxyAuthMethod 2>/dev/null || true
+        fi
         if $changed; then
             log_success "Git 代理 — 已移除"
             STAT_CONFIGURED=$((STAT_CONFIGURED + 1))
@@ -1040,6 +1077,10 @@ configure_git() {
     local ok=true
     git config --global http.proxy "$proxy_url" || ok=false
     git config --global https.proxy "$proxy_url" || ok=false
+    # 认证代理需显式指定认证方式
+    if [[ -n "$PROXY_USER" ]]; then
+        git config --global http.proxyAuthMethod basic 2>/dev/null || true
+    fi
 
     if $ok; then
         log_success "Git 代理 — 配置完成"
@@ -1065,7 +1106,7 @@ configure_npm() {
 
     if $REMOVE_MODE; then
         local changed=false
-        for key in proxy https-proxy noproxy; do
+        for key in proxy https-proxy no-proxy; do
             if npm config get "$key" &>/dev/null && [[ "$(npm config get "$key" 2>/dev/null)" != "null" ]]; then
                 if ! $DRY_RUN; then
                     npm config delete "$key" 2>/dev/null || true
@@ -1086,7 +1127,7 @@ configure_npm() {
     if $DRY_RUN; then
         print_dryrun "npm config set proxy \"${proxy_url}\""
         print_dryrun "npm config set https-proxy \"${proxy_url}\""
-        print_dryrun "npm config set noproxy \"${NO_PROXY}\""
+        print_dryrun "npm config set no-proxy \"${NO_PROXY}\""
         STAT_CONFIGURED=$((STAT_CONFIGURED + 1))
         return 0
     fi
@@ -1094,7 +1135,7 @@ configure_npm() {
     local ok=true
     npm config set proxy "$proxy_url" 2>/dev/null || ok=false
     npm config set https-proxy "$proxy_url" 2>/dev/null || ok=false
-    npm config set noproxy "$NO_PROXY" 2>/dev/null || ok=false
+    npm config set no-proxy "$NO_PROXY" 2>/dev/null || ok=false
 
     if $ok; then
         log_success "npm 代理 — 配置完成"
@@ -1254,8 +1295,8 @@ configure_wget() {
     local content
     if [[ -f "$wgetrc" ]]; then
         content=$(cat "$wgetrc")
-        # 移除旧的代理行
-        content=$(echo "$content" | grep -vE '^(https?_proxy|ftp_proxy|use_proxy)\s*=' || true)
+        # 移除旧的代理行和管理标记
+        content=$(echo "$content" | grep -vF "$MARKER" | grep -vE '^(https?_proxy|ftp_proxy|use_proxy|proxy_user|proxy_password)\s*=' || true)
         content+=$'\n'"${MARKER}"$'\n'
     else
         content="${MARKER}"$'\n'
@@ -1264,8 +1305,35 @@ configure_wget() {
     content+="http_proxy = ${proxy_url}"$'\n'
     content+="https_proxy = ${proxy_url}"$'\n'
     content+="ftp_proxy = ${proxy_url}"
+    # wget 不支持 URL 内嵌认证，需单独配置
+    if [[ -n "$PROXY_USER" ]]; then
+        content+=$'\n'"proxy_user = ${PROXY_USER}"
+        [[ -n "$PROXY_PASS" ]] && content+=$'\n'"proxy_password = ${PROXY_PASS}"
+    fi
 
     write_file "$wgetrc" "$content" "wget 全局代理"
+
+    # wget2 兼容 (使用独立配置文件 /etc/wget2rc)
+    if command_exists wget2 || (command_exists wget && wget --version 2>/dev/null | grep -qi wget2); then
+        local wget2rc="/etc/wget2rc"
+        local w2_content
+        if [[ -f "$wget2rc" ]]; then
+            w2_content=$(cat "$wget2rc")
+            w2_content=$(echo "$w2_content" | grep -vF "$MARKER" | grep -vE '^(https?_proxy|ftp_proxy|use_proxy|proxy_user|proxy_password)\s*=' || true)
+            w2_content+=$'\n'"${MARKER}"$'\n'
+        else
+            w2_content="${MARKER}"$'\n'
+        fi
+        w2_content+="use_proxy = on"$'\n'
+        w2_content+="http_proxy = ${proxy_url}"$'\n'
+        w2_content+="https_proxy = ${proxy_url}"$'\n'
+        w2_content+="ftp_proxy = ${proxy_url}"
+        if [[ -n "$PROXY_USER" ]]; then
+            w2_content+=$'\n'"proxy_user = ${PROXY_USER}"
+            [[ -n "$PROXY_PASS" ]] && w2_content+=$'\n'"proxy_password = ${PROXY_PASS}"
+        fi
+        write_file "$wget2rc" "$w2_content" "wget2 全局代理 (/etc/wget2rc)"
+    fi
 }
 
 #---------------------------------------------------------------------------
@@ -1315,6 +1383,10 @@ configure_snap() {
     if $ok; then
         log_success "Snap 代理 — 配置完成"
         STAT_CONFIGURED=$((STAT_CONFIGURED + 1))
+        # snapd 需重启才能让代理设置生效
+        if ! $DRY_RUN && systemctl is-active --quiet snapd 2>/dev/null; then
+            sudo_wrap systemctl restart snapd 2>/dev/null || log_warn "snapd 重启失败，请手动执行: sudo systemctl restart snapd"
+        fi
     else
         log_warn "Snap 代理 — 配置可能失败（snapd 可能未运行）"
         STAT_CONFIGURED=$((STAT_CONFIGURED + 1))
@@ -1357,14 +1429,48 @@ configure_containerd() {
         return 0
     fi
 
-    # containerd 通过 Docker daemon systemd 环境变量获取代理
-    # 无需在 config.toml 中配置代理，仅确保 Docker 代理已配置即可
-    if grep -qF "$MARKER" "$containerd_conf" 2>/dev/null; then
-        log_info "containerd 代理 — 由 Docker daemon 环境变量管理，跳过"
-        STAT_SKIPPED=$((STAT_SKIPPED + 1))
-    else
-        log_info "containerd 代理 — 由 Docker daemon 环境变量管理，无需额外配置"
-        STAT_SKIPPED=$((STAT_SKIPPED + 1))
+    # containerd 通过 systemd drop-in 获取代理环境变量
+    # (独立部署时不会继承 Docker 的环境变量)
+    local containerd_svc="/etc/systemd/system/containerd.service.d/http-proxy.conf"
+    local proxy_url
+    proxy_url=$(build_proxy_url)
+
+    if $REMOVE_MODE; then
+        if [[ -f "$containerd_svc" ]]; then
+            remove_file "$containerd_svc" "containerd systemd 代理"
+            if ! $DRY_RUN; then
+                sudo_wrap systemctl daemon-reload 2>/dev/null || true
+                systemctl is-active --quiet containerd 2>/dev/null && sudo_wrap systemctl restart containerd 2>/dev/null || true
+            fi
+        else
+            log_info "containerd systemd 代理配置不存在，跳过"
+            STAT_SKIPPED=$((STAT_SKIPPED + 1))
+        fi
+        return 0
+    fi
+
+    if ! systemctl is-active --quiet containerd 2>/dev/null && ! systemctl list-unit-files containerd.service 2>/dev/null | grep -q containerd; then
+        log_info "containerd 服务未安装，跳过"
+        return 2
+    fi
+
+    local content
+    content=$(cat <<EOF
+${MARKER}
+[Service]
+Environment="HTTP_PROXY=${proxy_url}"
+Environment="HTTPS_PROXY=${proxy_url}"
+Environment="NO_PROXY=${NO_PROXY}"
+Environment="http_proxy=${proxy_url}"
+Environment="https_proxy=${proxy_url}"
+Environment="no_proxy=${NO_PROXY}"
+EOF
+)
+    write_file "$containerd_svc" "$content" "containerd systemd 代理"
+
+    if ! $DRY_RUN; then
+        sudo_wrap systemctl daemon-reload 2>/dev/null || log_warn "systemctl daemon-reload 失败"
+        sudo_wrap systemctl restart containerd 2>/dev/null || log_warn "containerd 重启失败，请手动重启"
     fi
     log_info "containerd 通过 Docker daemon 环境变量获取代理，已由 Docker 配置覆盖"
 }
@@ -1378,6 +1484,8 @@ configure_systemd() {
     fi
 
     print_header "systemd 全局环境"
+    log_warn "这将影响本机所有 systemd 服务 (含数据库、缓存等本地服务)"
+    log_warn "如仅需 Docker/containerd 代理，请使用 --targets docker-daemon,containerd"
 
     local systemd_conf_dir="/etc/systemd/system.conf.d"
     local systemd_conf="${systemd_conf_dir}/proxy.conf"
